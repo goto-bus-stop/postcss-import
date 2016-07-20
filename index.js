@@ -5,6 +5,7 @@ var joinMedia = require("./lib/join-media")
 var resolveId = require("./lib/resolve-id")
 var loadContent = require("./lib/load-content")
 var parseStatements = require("./lib/parse-statements")
+var TreeNode = require("./lib/tree-node")
 
 function AtImport(options) {
   options = assign({
@@ -35,7 +36,11 @@ function AtImport(options) {
     var state = {
       importedFiles: {},
       hashFiles: {},
+      nodes: {},
     }
+
+    var entryPoint = new TreeNode("@", "")
+    state.nodes[entryPoint.id] = entryPoint
 
     if (styles.source && styles.source.input && styles.source.input.file) {
       state.importedFiles[styles.source.input.file] = {}
@@ -50,8 +55,37 @@ function AtImport(options) {
       styles,
       options,
       state,
-      []
-    ).then(function(bundle) {
+      [],
+      entryPoint
+    ).then(function(statements) {
+      var order = entryPoint.flatten()
+      var l = order.length
+      order.forEach(function(node) {
+        if (node.content == null) {
+          return
+        }
+        var first = true
+        for (var i = 0; i < l; i++) {
+          var importStmts = node.parents[order[i].id]
+          if (importStmts) {
+            importStmts.forEach(function(importStmt) {
+              if (first) {
+                if (options.skipDuplicates) {
+                  first = false
+                }
+                var children = importStmt.children || []
+                importStmt.children = children.concat(node.content)
+              }
+              else {
+                // duplicate: remove this import statement
+                importStmt.children = []
+              }
+            })
+          }
+        }
+      })
+
+      var bundle = squashImportStatements(statements)
 
       applyRaws(bundle)
       applyMedia(bundle)
@@ -154,16 +188,50 @@ function applyStyles(bundle, styles) {
   })
 }
 
+function squashImportStatements(statements) {
+  var imports = []
+  var bundle = []
+
+  // squash statements and their children
+  statements.forEach(function(stmt) {
+    if (stmt.type === "import") {
+      if (stmt.children) {
+        squashImportStatements(stmt.children).forEach(function(child, index) {
+          if (child.type === "import") {
+            imports.push(child)
+          }
+          else {
+            bundle.push(child)
+          }
+          // For better output
+          if (index === 0) {
+            child.parent = stmt
+          }
+        })
+      }
+      else {
+        imports.push(stmt)
+      }
+    }
+    else if (stmt.type === "media" || stmt.type === "nodes") {
+      bundle.push(stmt)
+    }
+  })
+
+  return imports.concat(bundle)
+}
+
 function parseStyles(
   result,
   styles,
   options,
   state,
-  media
+  media,
+  tree
 ) {
   var statements = parseStatements(result, styles)
 
-  return Promise.all(statements.map(function(stmt) {
+  return Promise.all(statements.map(function(stmt, index) {
     stmt.media = joinMedia(media, stmt.media)
 
     // skip protocol base uri (protocol://url) or protocol-relative
@@ -172,49 +240,24 @@ function parseStyles(
     }
     return resolveImportId(
       result,
+      index,
       stmt,
       options,
-      state
+      state,
+      tree
     )
   })).then(function() {
-    var imports = []
-    var bundle = []
-
-    // squash statements and their children
-    statements.forEach(function(stmt) {
-      if (stmt.type === "import") {
-        if (stmt.children) {
-          stmt.children.forEach(function(child, index) {
-            if (child.type === "import") {
-              imports.push(child)
-            }
-            else {
-              bundle.push(child)
-            }
-            // For better output
-            if (index === 0) {
-              child.parent = stmt
-            }
-          })
-        }
-        else {
-          imports.push(stmt)
-        }
-      }
-      else if (stmt.type === "media" || stmt.type === "nodes") {
-        bundle.push(stmt)
-      }
-    })
-
-    return imports.concat(bundle)
+    return statements
   })
 }
 
 function resolveImportId(
   result,
+  index,
   stmt,
   options,
-  state
+  state,
+  tree
 ) {
   var atRule = stmt.node
   var base = atRule.source && atRule.source.input && atRule.source.input.file
@@ -227,23 +270,28 @@ function resolveImportId(
       resolved = [ resolved ]
     }
     return Promise.all(resolved.map(function(file) {
+      var node = new TreeNode(file, stmt.media)
+      if (state.nodes[node.id]) {
+        node = state.nodes[node.id]
+      }
+      else {
+        state.nodes[node.id] = node
+      }
+      tree.addImport(index, node, stmt)
+
       return loadImportContent(
         result,
         stmt,
         file,
         options,
-        state
-      )
+        state,
+        node
+      ).then(function(statements) {
+        if (node.content == null) {
+          node.content = statements
+        }
+      })
     }))
-  })
-  .then(function(result) {
-    // Merge loaded statements
-    stmt.children = result.reduce(function(result, statements) {
-      if (statements) {
-        result = result.concat(statements)
-      }
-      return result
-    }, [])
   })
   .catch(function(err) {
     result.warn(err.message, { node: atRule })
@@ -255,7 +303,8 @@ function loadImportContent(
   stmt,
   filename,
   options,
-  state
+  state,
+  tree
 ) {
   var atRule = stmt.node
   var media = stmt.media
@@ -265,17 +314,11 @@ function loadImportContent(
       state.importedFiles[filename] &&
       state.importedFiles[filename][media]
     ) {
-      return
+      return state.importedFiles[filename][media]
     }
-
-    // save imported files to skip them next time
-    if (!state.importedFiles[filename]) {
-      state.importedFiles[filename] = {}
-    }
-    state.importedFiles[filename][media] = true
   }
 
-  return Promise.resolve(options.load(filename, options))
+  var promise = Promise.resolve(options.load(filename, options))
   .then(function(content) {
     if (typeof options.transform !== "function") {
       return content
@@ -288,7 +331,7 @@ function loadImportContent(
   .then(function(content) {
     if (content.trim() === "") {
       result.warn(filename + " is empty", { node: atRule })
-      return
+      return []
     }
 
     // skip previous imported files not containing @import rules
@@ -296,7 +339,7 @@ function loadImportContent(
       state.hashFiles[content] &&
       state.hashFiles[content][media]
     ) {
-      return
+      return []
     }
 
     return postcss(options.plugins).process(content, {
@@ -327,10 +370,21 @@ function loadImportContent(
         styles,
         options,
         state,
-        media
+        media,
+        tree
       )
     })
   })
+
+  if (options.skipDuplicates) {
+    // save imported files to skip them next time
+    if (!state.importedFiles[filename]) {
+      state.importedFiles[filename] = {}
+    }
+    state.importedFiles[filename][media] = promise
+  }
+
+  return promise
 }
 
 module.exports = postcss.plugin(
